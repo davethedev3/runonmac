@@ -47,7 +47,7 @@ permissions:
 jobs:
   run:
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: ${{ inputs.timeout }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout) }}
     steps:
       - uses: actions/checkout@v7
         with:
