@@ -88,6 +88,12 @@ resp=$(jq -n \
 id=$(jq -r .workflow_run_id <<<"$resp")
 echo "runonmac: $(jq -r .html_url <<<"$resp")" >&2
 
+# A fresh run's jobs endpoint can 404 briefly, which makes `gh run watch` give up.
+for _ in {1..30}; do
+  gh api "repos/$repo/actions/runs/$id/jobs" >/dev/null 2>&1 && break
+  sleep 2
+done
+
 status=0
 gh run watch "$id" -R "$repo" --compact --exit-status >&2 || status=$?
 
