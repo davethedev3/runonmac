@@ -82,7 +82,7 @@ resp=$(jq -n \
   --arg main "$main" --arg command "$command" --arg runner "$runner" \
   --arg repository "$repository" --arg ref "$ref" --arg timeout "$timeout" \
   --arg artifacts "$(printf '%s\n' "${artifacts[@]}")" --arg label "${label:0:100}" \
-  '{ref: $main, inputs: {command: $command, runner: $runner, repository: $repository,
+  '{ref: $main, return_run_details: true, inputs:{command: $command, runner: $runner, repository: $repository,
     ref: $ref, artifacts: ($artifacts | rtrimstr("\n")), timeout: $timeout, label: $label}}' |
   gh api -X POST "repos/$repo/actions/workflows/run.yml/dispatches" --input -)
 id=$(jq -r .workflow_run_id <<<"$resp")
