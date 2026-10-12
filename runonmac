@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Run a command on a free GitHub-hosted macOS runner through this repo's run.yml.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: runonmac [options] [--] COMMAND...
+       runonmac [options] -f SCRIPT
+
+Runs COMMAND (or the contents of SCRIPT) with bash on a GitHub-hosted macOS
+runner, waits for it, prints its output and downloads any artifacts. Exits
+non-zero if the run fails.
+
+  -r, --runner LABEL     runner image (default macos-latest; choices in run.yml)
+  -f, --file SCRIPT      send the contents of a local bash script as the command
+  -d, --dir DIR          ship DIR as the workspace through a temporary branch
+  -R, --repo OWNER/NAME  check out another public repo as the workspace
+      --ref REF          branch, tag or SHA to check out with --repo
+  -a, --artifact PATH    upload PATH or glob from the workspace; repeatable
+  -o, --out DIR          where artifacts land (default ./runonmac-out/RUN_ID)
+  -t, --timeout MIN      job timeout in minutes (default 60, max 360)
+  -h, --help
+
+Everything sent is public: the command, its log, artifacts and shipped DIRs.
+RUNONMAC_REPO=owner/name targets a repo other than the one holding this script.
+EOF
+}
+
+die() { echo "runonmac: $*" >&2; exit 2; }
+
+here=$(dirname "$(readlink -f "$0")")
+runner=macos-latest file='' dir='' repository='' ref='' out='' timeout=60
+artifacts=()
+
+while (($#)); do
+  case $1 in
+    -r|--runner)   runner=$2; shift 2 ;;
+    -f|--file)     file=$2; shift 2 ;;
+    -d|--dir)      dir=$2; shift 2 ;;
+    -R|--repo)     repository=$2; shift 2 ;;
+    --ref)         ref=$2; shift 2 ;;
+    -a|--artifact) artifacts+=("$2"); shift 2 ;;
+    -o|--out)      out=$2; shift 2 ;;
+    -t|--timeout)  timeout=$2; shift 2 ;;
+    -h|--help)     usage; exit 0 ;;
+    --)            shift; break ;;
+    -*)            usage >&2; die "unknown option $1" ;;
+    *)             break ;;
+  esac
+done
+
+if [[ $file ]]; then
+  (($# == 0)) || die "give either -f SCRIPT or COMMAND, not both"
+  command=$(<"$file")
+  label=$(basename "$file")
+else
+  (($#)) || { usage >&2; exit 2; }
+  command="$*"
+  label=${command%%$'\n'*}
+fi
+[[ $dir && $repository ]] && die "give either --dir or --repo, not both"
+
+read -r repo main < <(cd "$here" && gh repo view ${RUNONMAC_REPO:+"$RUNONMAC_REPO"} \
+  --json nameWithOwner,defaultBranchRef -q '"\(.nameWithOwner) \(.defaultBranchRef.name)"')
+
+if [[ $dir ]]; then
+  # Snapshot DIR (honouring its .gitignore) into a parentless commit on a
+  # throwaway branch, without touching this checkout's index or HEAD.
+  [[ -d $dir ]] || die "not a directory: $dir"
+  gitdir=$(git -C "$here" rev-parse --absolute-git-dir)
+  ref="run/$(date +%s)-$RANDOM"
+  idx=$(mktemp -d)
+  trap 'rm -rf "$idx"; git --git-dir="$gitdir" push -q origin --delete "$ref" 2>/dev/null || true' EXIT
+  export GIT_DIR=$gitdir GIT_INDEX_FILE=$idx/index
+  (cd "$dir" && git --work-tree=. add -A)
+  commit=$(git commit-tree "$(git write-tree)" -m "runonmac: $label")
+  unset GIT_DIR GIT_INDEX_FILE
+  git --git-dir="$gitdir" push -q origin "$commit:refs/heads/$ref"
+fi
+
+resp=$(jq -n \
+  --arg main "$main" --arg command "$command" --arg runner "$runner" \
+  --arg repository "$repository" --arg ref "$ref" --arg timeout "$timeout" \
+  --arg artifacts "$(printf '%s\n' "${artifacts[@]}")" --arg label "${label:0:100}" \
+  '{ref: $main, inputs: {command: $command, runner: $runner, repository: $repository,
+    ref: $ref, artifacts: ($artifacts | rtrimstr("\n")), timeout: $timeout, label: $label}}' |
+  gh api -X POST "repos/$repo/actions/workflows/run.yml/dispatches" --input -)
+id=$(jq -r .workflow_run_id <<<"$resp")
+echo "runonmac: $(jq -r .html_url <<<"$resp")" >&2
+
+status=0
+gh run watch "$id" -R "$repo" --compact --exit-status >&2 || status=$?
+
+# The archived log can lag the run's completion by a few seconds.
+for _ in 1 2 3 4 5; do
+  log=$(gh run view "$id" -R "$repo" --log 2>/dev/null) && break
+  sleep 3
+done
+# Lines are "job<TAB>step<TAB>timestamp text"; keep the Run step's output,
+# skipping the runner's echo of the step definition (up to its first endgroup).
+awk -F'\t' '$2 == "Run" {
+  sub(/^[^\t]*\t[^\t]*\t[^ ]* /, "")
+  if (body) print; else if (/^##\[endgroup\]/) body = 1
+}' <<<"${log:-}"
+
+if ((${#artifacts[@]})); then
+  out=${out:-runonmac-out/$id}
+  gh run download "$id" -R "$repo" -n output -D "$out" && echo "runonmac: artifacts in $out" >&2
+fi
+exit "$status"

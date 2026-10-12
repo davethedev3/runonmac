@@ -1,0 +1,69 @@
+name: run
+run-name: ${{ inputs.label || format('run on {0}', inputs.runner) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: Bash script to run in the workspace
+        required: true
+        type: string
+      runner:
+        description: Runner image (standard labels only; these are free on public repos)
+        type: choice
+        default: macos-latest
+        options:
+          - macos-latest
+          - macos-26
+          - macos-26-intel
+          - macos-15
+          - macos-15-intel
+          - macos-14
+          - xcode-27
+      repository:
+        description: Public repo to check out as the workspace (owner/name); empty for this repo
+        type: string
+        default: ''
+      ref:
+        description: Branch, tag or SHA to check out; empty for the default branch
+        type: string
+        default: ''
+      artifacts:
+        description: Newline-separated paths or globs to upload as the "output" artifact
+        type: string
+        default: ''
+      timeout:
+        description: Job timeout in minutes (max 360)
+        type: number
+        default: 60
+      label:
+        description: Run title shown in the Actions list
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Run
+        env:
+          COMMAND: ${{ inputs.command }}
+        run: bash -eo pipefail -c "$COMMAND"
+
+      - uses: actions/upload-artifact@v7
+        if: always() && inputs.artifacts != ''
+        with:
+          name: output
+          path: ${{ inputs.artifacts }}
+          retention-days: 7
+          if-no-files-found: warn
