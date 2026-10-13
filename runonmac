@@ -74,13 +74,14 @@ for tool in age age-keygen gh git jq; do
 done
 
 if [[ ! -f $identity ]]; then
-  # Generate aside and move into place without clobbering, so concurrent
-  # first runs all end up using the same identity.
+  # Generate aside and hard-link into place (atomic, never clobbers), so
+  # concurrent first runs all end up using the same identity.
   mkdir -p "$(dirname "$identity")"
   (umask 077; age-keygen -o "$identity.$$" 2>/dev/null)
-  mv -n "$identity.$$" "$identity"
-  if [[ -f $identity.$$ ]]; then rm "$identity.$$"
-  else echo "runonmac: created output identity $identity" >&2; fi
+  if ln "$identity.$$" "$identity" 2>/dev/null; then
+    echo "runonmac: created output identity $identity" >&2
+  fi
+  rm "$identity.$$"
 fi
 
 read -r repo main < <(cd "$here" && gh repo view ${RUNONMAC_REPO:+"$RUNONMAC_REPO"} \
