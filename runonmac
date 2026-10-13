@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run a command on a free GitHub-hosted macOS runner through this repo's run.yml.
+# Run a command on a free GitHub-hosted macOS runner through this repo's run.yml,
+# with the command, shipped files, log and returned files all age-encrypted.
 set -euo pipefail
 
 usage() {
@@ -8,20 +9,21 @@ usage: runonmac [options] [--] COMMAND...
        runonmac [options] -f SCRIPT
 
 Runs COMMAND (or the contents of SCRIPT) with bash on a GitHub-hosted macOS
-runner, waits for it, prints its output and downloads any artifacts. Exits
-non-zero if the run fails.
+runner, waits for it, prints its output and fetches any requested files.
+Exits non-zero if the run fails.
 
   -r, --runner LABEL     runner image (default macos-latest; choices in run.yml)
   -f, --file SCRIPT      send the contents of a local bash script as the command
   -d, --dir DIR          ship DIR as the workspace through a temporary branch
   -R, --repo OWNER/NAME  check out another public repo as the workspace
       --ref REF          branch, tag or SHA to check out with --repo
-  -a, --artifact PATH    upload PATH or glob from the workspace; repeatable
-  -o, --out DIR          where artifacts land (default ./runonmac-out/RUN_ID)
-  -t, --timeout MIN      job timeout in minutes (default 60, max 360)
+  -a, --artifact PATH    return PATH or glob from the workspace; repeatable
+  -o, --out DIR          where returned files land (default ./runonmac-out/RUN_ID)
+  -t, --timeout MIN      command timeout in minutes (default 60, max 350)
   -h, --help
 
-Everything sent is public: the command, its log, artifacts and shipped DIRs.
+The command, artifact list, shipped DIR, log and returned files are encrypted.
+Run timing, runner image, exit status, --repo/--ref and ciphertext sizes are public.
 RUNONMAC_REPO=owner/name targets a repo other than the one holding this script.
 EOF
 }
@@ -52,38 +54,55 @@ done
 if [[ $file ]]; then
   (($# == 0)) || die "give either -f SCRIPT or COMMAND, not both"
   command=$(<"$file")
-  label=$(basename "$file")
 else
   (($#)) || { usage >&2; exit 2; }
   command="$*"
-  label=${command%%$'\n'*}
 fi
 [[ $dir && $repository ]] && die "give either --dir or --repo, not both"
+[[ ! $dir || -d $dir ]] || die "not a directory: $dir"
+for tool in age age-keygen gh git jq; do
+  command -v "$tool" >/dev/null || die "$tool not found"
+done
 
 read -r repo main < <(cd "$here" && gh repo view ${RUNONMAC_REPO:+"$RUNONMAC_REPO"} \
   --json nameWithOwner,defaultBranchRef -q '"\(.nameWithOwner) \(.defaultBranchRef.name)"')
+runner_pub=$(gh api -H 'Accept: application/vnd.github.raw' "repos/$repo/contents/runner.pub")
+seal() { age -a -r "$runner_pub"; }
+
+# Results come back encrypted to a keypair that exists only for this run.
+tmp=$(mktemp -d)
+gitdir='' branch=''
+trap 'rm -rf "$tmp"
+  if [[ $branch ]]; then git --git-dir="$gitdir" push -q origin --delete "$branch" 2>/dev/null || true; fi' EXIT
+age-keygen -o "$tmp/id" 2>/dev/null
+recipient=$(age-keygen -y "$tmp/id")
 
 if [[ $dir ]]; then
-  # Snapshot DIR (honouring its .gitignore) into a parentless commit on a
-  # throwaway branch, without touching this checkout's index or HEAD.
-  [[ -d $dir ]] || die "not a directory: $dir"
+  # Snapshot DIR (honouring its .gitignore) in a scratch repo, so plaintext never
+  # enters this repo's object store; only the encrypted tarball is committed.
+  git init -q "$tmp/snap"
+  (cd "$dir" && git --git-dir="$tmp/snap/.git" --work-tree=. add -A)
+  git --git-dir="$tmp/snap/.git" archive "$(git --git-dir="$tmp/snap/.git" write-tree)" |
+    age -r "$runner_pub" -o "$tmp/payload.age"
   gitdir=$(git -C "$here" rev-parse --absolute-git-dir)
-  ref="run/$(date +%s)-$RANDOM"
-  idx=$(mktemp -d)
-  trap 'rm -rf "$idx"; git --git-dir="$gitdir" push -q origin --delete "$ref" 2>/dev/null || true' EXIT
-  export GIT_DIR=$gitdir GIT_INDEX_FILE=$idx/index
-  (cd "$dir" && git --work-tree=. add -A)
-  commit=$(git commit-tree "$(git write-tree)" -m "runonmac: $label")
-  unset GIT_DIR GIT_INDEX_FILE
-  git --git-dir="$gitdir" push -q origin "$commit:refs/heads/$ref"
+  export GIT_DIR=$gitdir
+  blob=$(git hash-object -w "$tmp/payload.age")
+  tree=$(printf '100644 blob %s\t.runonmac-payload.age\n' "$blob" | git mktree)
+  commit=$(git commit-tree "$tree" -m runonmac)
+  unset GIT_DIR
+  branch="run/$(date +%s)-$RANDOM"
+  git --git-dir="$gitdir" push -q origin "$commit:refs/heads/$branch"
+  ref=$branch
 fi
 
 resp=$(jq -n \
-  --arg main "$main" --arg command "$command" --arg runner "$runner" \
-  --arg repository "$repository" --arg ref "$ref" --arg timeout "$timeout" \
-  --arg artifacts "$(printf '%s\n' "${artifacts[@]}")" --arg label "${label:0:100}" \
-  '{ref: $main, return_run_details: true, inputs:{command: $command, runner: $runner, repository: $repository,
-    ref: $ref, artifacts: ($artifacts | rtrimstr("\n")), timeout: $timeout, label: $label}}' |
+  --arg main "$main" --arg runner "$runner" --arg repository "$repository" \
+  --arg ref "$ref" --arg recipient "$recipient" --arg timeout "$timeout" \
+  --arg command "$(printf '%s\n' "$command" | seal)" \
+  --arg artifacts "$(printf '%s\n' "${artifacts[@]}" | seal)" \
+  '{ref: $main, return_run_details: true, inputs: {command: $command, runner: $runner,
+    repository: $repository, ref: $ref, artifacts: $artifacts, recipient: $recipient,
+    timeout: $timeout}}' |
   gh api -X POST "repos/$repo/actions/workflows/run.yml/dispatches" --input -)
 id=$(jq -r .workflow_run_id <<<"$resp")
 echo "runonmac: $(jq -r .html_url <<<"$resp")" >&2
@@ -97,20 +116,18 @@ done
 status=0
 gh run watch "$id" -R "$repo" --compact --exit-status >&2 || status=$?
 
-# The archived log can lag the run's completion by a few seconds.
-for _ in 1 2 3 4 5; do
-  log=$(gh run view "$id" -R "$repo" --log 2>/dev/null) && break
-  sleep 3
-done
-# Lines are "job<TAB>step<TAB>timestamp text"; keep the Run step's output,
-# skipping the runner's echo of the step definition (up to its first endgroup).
-awk -F'\t' '$2 == "Run" {
-  sub(/^[^\t]*\t[^\t]*\t[^ ]* /, "")
-  if (body) print; else if (/^##\[endgroup\]/) body = 1
-}' <<<"${log:-}"
-
-if ((${#artifacts[@]})); then
+if ! gh run download "$id" -R "$repo" -n output -D "$tmp/output" 2>/dev/null; then
+  # No sealed output means the run failed before the command; its log holds only ciphertext.
+  gh run view "$id" -R "$repo" --log-failed >&2
+  exit $((status ? status : 1))
+fi
+age -d -i "$tmp/id" "$tmp/output/log.age"
+if [[ -f $tmp/output/files.age ]]; then
   out=${out:-runonmac-out/$id}
-  gh run download "$id" -R "$repo" -n output -D "$out" && echo "runonmac: artifacts in $out" >&2
+  mkdir -p "$out"
+  age -d -i "$tmp/id" "$tmp/output/files.age" | tar -x -C "$out"
+  echo "runonmac: files in $out" >&2
+elif ((${#artifacts[@]})); then
+  echo "runonmac: no files matched the -a patterns" >&2
 fi
 exit "$status"

@@ -1,11 +1,11 @@
 name: run
-run-name: ${{ inputs.label || format('run on {0}', inputs.runner) }}
+run-name: run on ${{ inputs.runner }}
 
 on:
   workflow_dispatch:
     inputs:
       command:
-        description: Bash script to run in the workspace
+        description: Bash script, age-encrypted (armored) to runner.pub
         required: true
         type: string
       runner:
@@ -29,25 +29,28 @@ on:
         type: string
         default: ''
       artifacts:
-        description: Newline-separated paths or globs to upload as the "output" artifact
+        description: Newline-separated paths or globs to return, age-encrypted (armored) to runner.pub
+        required: true
         type: string
-        default: ''
+      recipient:
+        description: age recipient that the log and returned files are encrypted to
+        required: true
+        type: string
       timeout:
-        description: Job timeout in minutes (max 360)
+        description: Command timeout in minutes (max 350)
         type: number
         default: 60
-      label:
-        description: Run title shown in the Actions list
-        type: string
-        default: ''
 
 permissions:
   contents: read
 
+env:
+  AGE_VERSION: v1.3.2
+
 jobs:
   run:
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: ${{ fromJSON(inputs.timeout) }}
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v7
         with:
@@ -55,15 +58,66 @@ jobs:
           ref: ${{ inputs.ref }}
           persist-credentials: false
 
-      - name: Run
+      - name: Install age
+        run: |
+          case $(uname -m) in
+            arm64)  arch=arm64 sha=e2020b073c44f692685a24d6abc378817eb81ffaaf49fd0531ef8565f767f2f5 ;;
+            x86_64) arch=amd64 sha=1d1e4bc66e1427edad7739ae7616157de0e79db8b6d2a1497d7d9925fb06a539 ;;
+          esac
+          tgz=$RUNNER_TEMP/age.tar.gz
+          curl -fsSL -o "$tgz" "https://github.com/FiloSottile/age/releases/download/$AGE_VERSION/age-$AGE_VERSION-darwin-$arch.tar.gz"
+          echo "$sha  $tgz" | shasum -a 256 -c
+          tar -xzf "$tgz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/age" >> "$GITHUB_PATH"
+
+      # The only step that sees the runner key; it is deleted before the command runs.
+      - name: Decrypt
         env:
           COMMAND: ${{ inputs.command }}
-        run: bash -eo pipefail -c "$COMMAND"
+          ARTIFACTS: ${{ inputs.artifacts }}
+          RUNONMAC_KEY: ${{ secrets.RUNONMAC_KEY }}
+        run: |
+          key=$RUNNER_TEMP/key
+          (umask 077; printf '%s\n' "$RUNONMAC_KEY" > "$key")
+          age -d -i "$key" -o "$RUNNER_TEMP/command.sh" <<<"$COMMAND"
+          age -d -i "$key" -o "$RUNNER_TEMP/artifacts" <<<"$ARTIFACTS"
+          if [[ -f .runonmac-payload.age ]]; then
+            age -d -i "$key" .runonmac-payload.age | tar -x
+            rm .runonmac-payload.age
+          fi
+          rm "$key"
+
+      # Output goes only to a file, so the public log shows nothing but the exit code.
+      - name: Run
+        id: run
+        timeout-minutes: ${{ fromJSON(inputs.timeout) }}
+        run: bash -eo pipefail "$RUNNER_TEMP/command.sh" > "$RUNNER_TEMP/log" 2>&1
+
+      - name: Seal
+        id: seal
+        if: always() && steps.run.outcome != 'skipped'
+        env:
+          RECIPIENT: ${{ inputs.recipient }}
+        run: |
+          out=$RUNNER_TEMP/output
+          mkdir -p "$out"
+          age -r "$RECIPIENT" -o "$out/log.age" "$RUNNER_TEMP/log"
+          shopt -s globstar nullglob
+          IFS=$'\n'
+          paths=()
+          while read -r pattern; do
+            # Unquoted on purpose: the pattern is glob-expanded (split on newlines only).
+            # shellcheck disable=SC2206
+            [[ $pattern ]] && paths+=($pattern)
+          done < "$RUNNER_TEMP/artifacts"
+          if ((${#paths[@]})); then
+            tar --no-mac-metadata --no-xattrs -cf - -- "${paths[@]}" | age -r "$RECIPIENT" -o "$out/files.age"
+          fi
 
       - uses: actions/upload-artifact@v7
-        if: always() && inputs.artifacts != ''
+        if: always() && steps.seal.outcome == 'success'
         with:
           name: output
-          path: ${{ inputs.artifacts }}
+          path: ${{ runner.temp }}/output/
           retention-days: 7
-          if-no-files-found: warn
+          if-no-files-found: error
