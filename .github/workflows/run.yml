@@ -102,7 +102,7 @@ jobs:
           out=$RUNNER_TEMP/output
           mkdir -p "$out"
           age -r "$RECIPIENT" -o "$out/log.age" "$RUNNER_TEMP/log"
-          shopt -s globstar nullglob
+          shopt -s nullglob
           IFS=$'\n'
           paths=()
           while read -r pattern; do

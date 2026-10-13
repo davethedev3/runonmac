@@ -7,6 +7,7 @@ usage() {
   cat <<'EOF'
 usage: runonmac [options] [--] COMMAND...
        runonmac [options] -f SCRIPT
+       runonmac --fetch RUN_ID [-o DIR]
 
 Runs COMMAND (or the contents of SCRIPT) with bash on a GitHub-hosted macOS
 runner, waits for it, prints its output and fetches any requested files.
@@ -17,13 +18,17 @@ Exits non-zero if the run fails.
   -d, --dir DIR          ship DIR as the workspace through a temporary branch
   -R, --repo OWNER/NAME  check out another public repo as the workspace
       --ref REF          branch, tag or SHA to check out with --repo
-  -a, --artifact PATH    return PATH or glob from the workspace; repeatable
+  -a, --artifact PATH    return PATH (a file, directory or glob) from the
+                         workspace; repeatable
   -o, --out DIR          where returned files land (default ./runonmac-out/RUN_ID)
   -t, --timeout MIN      command timeout in minutes (default 60, max 350)
+      --fetch RUN_ID     wait for an earlier run and collect its output
   -h, --help
 
 The command, artifact list, shipped DIR, log and returned files are encrypted.
 Run timing, runner image, exit status, --repo/--ref and ciphertext sizes are public.
+Output is encrypted to the age identity at $RUNONMAC_IDENTITY
+(default ~/.config/runonmac/identity, created on first use).
 RUNONMAC_REPO=owner/name targets a repo other than the one holding this script.
 EOF
 }
@@ -31,7 +36,8 @@ EOF
 die() { echo "runonmac: $*" >&2; exit 2; }
 
 here=$(dirname "$(readlink -f "$0")")
-runner=macos-latest file='' dir='' repository='' ref='' out='' timeout=60
+identity=${RUNONMAC_IDENTITY:-${XDG_CONFIG_HOME:-$HOME/.config}/runonmac/identity}
+runner=macos-latest file='' dir='' repository='' ref='' out='' timeout=60 id=''
 artifacts=()
 
 while (($#)); do
@@ -44,6 +50,7 @@ while (($#)); do
     -a|--artifact) artifacts+=("$2"); shift 2 ;;
     -o|--out)      out=$2; shift 2 ;;
     -t|--timeout)  timeout=$2; shift 2 ;;
+    --fetch)       id=$2; shift 2 ;;
     -h|--help)     usage; exit 0 ;;
     --)            shift; break ;;
     -*)            usage >&2; die "unknown option $1" ;;
@@ -51,7 +58,9 @@ while (($#)); do
   esac
 done
 
-if [[ $file ]]; then
+if [[ $id ]]; then
+  if (($#)) || [[ $file ]]; then die "--fetch takes no command"; fi
+elif [[ $file ]]; then
   (($# == 0)) || die "give either -f SCRIPT or COMMAND, not both"
   command=$(<"$file")
 else
@@ -64,54 +73,61 @@ for tool in age age-keygen gh git jq; do
   command -v "$tool" >/dev/null || die "$tool not found"
 done
 
+if [[ ! -f $identity ]]; then
+  mkdir -p "$(dirname "$identity")"
+  (umask 077; age-keygen -o "$identity" 2>/dev/null)
+  echo "runonmac: created output identity $identity" >&2
+fi
+
 read -r repo main < <(cd "$here" && gh repo view ${RUNONMAC_REPO:+"$RUNONMAC_REPO"} \
   --json nameWithOwner,defaultBranchRef -q '"\(.nameWithOwner) \(.defaultBranchRef.name)"')
-runner_pub=$(gh api -H 'Accept: application/vnd.github.raw' "repos/$repo/contents/runner.pub")
-seal() { age -a -r "$runner_pub"; }
 
-# Results come back encrypted to a keypair that exists only for this run.
 tmp=$(mktemp -d)
 gitdir='' branch=''
 trap 'rm -rf "$tmp"
   if [[ $branch ]]; then git --git-dir="$gitdir" push -q origin --delete "$branch" 2>/dev/null || true; fi' EXIT
-age-keygen -o "$tmp/id" 2>/dev/null
-recipient=$(age-keygen -y "$tmp/id")
 
-if [[ $dir ]]; then
-  # Snapshot DIR (honouring its .gitignore) in a scratch repo, so plaintext never
-  # enters this repo's object store; only the encrypted tarball is committed.
-  git init -q "$tmp/snap"
-  (cd "$dir" && git --git-dir="$tmp/snap/.git" --work-tree=. add -A)
-  git --git-dir="$tmp/snap/.git" archive "$(git --git-dir="$tmp/snap/.git" write-tree)" |
-    age -r "$runner_pub" -o "$tmp/payload.age"
-  gitdir=$(git -C "$here" rev-parse --absolute-git-dir)
-  export GIT_DIR=$gitdir
-  blob=$(git hash-object -w "$tmp/payload.age")
-  tree=$(printf '100644 blob %s\t.runonmac-payload.age\n' "$blob" | git mktree)
-  commit=$(git commit-tree "$tree" -m runonmac)
-  unset GIT_DIR
-  branch="run/$(date +%s)-$RANDOM"
-  git --git-dir="$gitdir" push -q origin "$commit:refs/heads/$branch"
-  ref=$branch
+if [[ ! $id ]]; then
+  runner_pub=$(gh api -H 'Accept: application/vnd.github.raw' "repos/$repo/contents/runner.pub")
+  seal() { age -a -r "$runner_pub"; }
+
+  if [[ $dir ]]; then
+    # Snapshot DIR (honouring its .gitignore) in a scratch repo, so plaintext never
+    # enters this repo's object store; only the encrypted tarball is committed.
+    git init -q "$tmp/snap"
+    (cd "$dir" && git --git-dir="$tmp/snap/.git" --work-tree=. add -A)
+    git --git-dir="$tmp/snap/.git" archive "$(git --git-dir="$tmp/snap/.git" write-tree)" |
+      age -r "$runner_pub" -o "$tmp/payload.age"
+    gitdir=$(git -C "$here" rev-parse --absolute-git-dir)
+    export GIT_DIR=$gitdir
+    blob=$(git hash-object -w "$tmp/payload.age")
+    tree=$(printf '100644 blob %s\t.runonmac-payload.age\n' "$blob" | git mktree)
+    commit=$(git commit-tree "$tree" -m runonmac)
+    unset GIT_DIR
+    branch="run/$(date +%s)-$RANDOM"
+    git --git-dir="$gitdir" push -q origin "$commit:refs/heads/$branch"
+    ref=$branch
+  fi
+
+  resp=$(jq -n \
+    --arg main "$main" --arg runner "$runner" --arg repository "$repository" \
+    --arg ref "$ref" --arg recipient "$(age-keygen -y "$identity")" --arg timeout "$timeout" \
+    --arg command "$(printf '%s\n' "$command" | seal)" \
+    --arg artifacts "$(printf '%s\n' "${artifacts[@]}" | seal)" \
+    '{ref: $main, return_run_details: true, inputs: {command: $command, runner: $runner,
+      repository: $repository, ref: $ref, artifacts: $artifacts, recipient: $recipient,
+      timeout: $timeout}}' |
+    gh api -X POST "repos/$repo/actions/workflows/run.yml/dispatches" --input -)
+  id=$(jq -r .workflow_run_id <<<"$resp")
+  echo "runonmac: $(jq -r .html_url <<<"$resp")" >&2
+  echo "runonmac: if interrupted, collect it later with: runonmac --fetch $id" >&2
+
+  # A fresh run's jobs endpoint can 404 briefly, which makes `gh run watch` give up.
+  for _ in {1..30}; do
+    gh api "repos/$repo/actions/runs/$id/jobs" >/dev/null 2>&1 && break
+    sleep 2
+  done
 fi
-
-resp=$(jq -n \
-  --arg main "$main" --arg runner "$runner" --arg repository "$repository" \
-  --arg ref "$ref" --arg recipient "$recipient" --arg timeout "$timeout" \
-  --arg command "$(printf '%s\n' "$command" | seal)" \
-  --arg artifacts "$(printf '%s\n' "${artifacts[@]}" | seal)" \
-  '{ref: $main, return_run_details: true, inputs: {command: $command, runner: $runner,
-    repository: $repository, ref: $ref, artifacts: $artifacts, recipient: $recipient,
-    timeout: $timeout}}' |
-  gh api -X POST "repos/$repo/actions/workflows/run.yml/dispatches" --input -)
-id=$(jq -r .workflow_run_id <<<"$resp")
-echo "runonmac: $(jq -r .html_url <<<"$resp")" >&2
-
-# A fresh run's jobs endpoint can 404 briefly, which makes `gh run watch` give up.
-for _ in {1..30}; do
-  gh api "repos/$repo/actions/runs/$id/jobs" >/dev/null 2>&1 && break
-  sleep 2
-done
 
 status=0
 gh run watch "$id" -R "$repo" --compact --exit-status >&2 || status=$?
@@ -121,11 +137,11 @@ if ! gh run download "$id" -R "$repo" -n output -D "$tmp/output" 2>/dev/null; th
   gh run view "$id" -R "$repo" --log-failed >&2
   exit $((status ? status : 1))
 fi
-age -d -i "$tmp/id" "$tmp/output/log.age"
+age -d -i "$identity" "$tmp/output/log.age"
 if [[ -f $tmp/output/files.age ]]; then
   out=${out:-runonmac-out/$id}
   mkdir -p "$out"
-  age -d -i "$tmp/id" "$tmp/output/files.age" | tar -x -C "$out"
+  age -d -i "$identity" "$tmp/output/files.age" | tar -x -C "$out"
   echo "runonmac: files in $out" >&2
 elif ((${#artifacts[@]})); then
   echo "runonmac: no files matched the -a patterns" >&2
