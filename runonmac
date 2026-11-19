@@ -157,6 +157,7 @@ if [[ $stream ]]; then
       done
     else
       stop_listener
+      tail -n 3 "$tmp/live/cloudflared.log" 2>/dev/null | sed 's/^/runonmac: cloudflared: /' >&2 || true
       say "no tunnel came up; output will print when the run ends"
     fi
   else
