@@ -1,7 +1,8 @@
 // Live log receiver for runonmac, run by the CLI with bun:
 //   bun listen.ts IDENTITY DIR PARENT_PID
 // Serves 127.0.0.1 through a cloudflared quick tunnel and writes DIR/url
-// (https://<host>.trycloudflare.com/<token>) once the tunnel is up. The runner
+// (https://<host>.trycloudflare.com/<token>) once the tunnel is up, and
+// answers GET <url>/ready with 204 so the CLI can tell it's reachable. The runner
 // POSTs to <url>/<offset> a binary age file, encrypted to IDENTITY's recipient,
 // holding the log bytes from <offset>. Bytes not yet printed go to stdout
 // raw, in order, and DIR/offset records how many have been printed. Every
@@ -42,7 +43,9 @@ const server = Bun.serve({
   port: 0,
   maxRequestBodySize: 16 * 1024 * 1024,
   async fetch(req) {
-    const m = new URL(req.url).pathname.match(/^\/([0-9a-f]+)\/(\d+)$/)
+    const path = new URL(req.url).pathname
+    if (req.method === 'GET' && path === `/${token}/ready`) return new Response(null, { status: 204 })
+    const m = path.match(/^\/([0-9a-f]+)\/(\d+)$/)
     if (req.method !== 'POST' || !m || m[1] !== token) return new Response('', { status: 404 })
     const offset = Number(m[2])
     const plain = await decrypt(await req.arrayBuffer())
@@ -50,7 +53,7 @@ const server = Bun.serve({
     if (plain === null) return new Response(String(printed), { status: 400 })
     if (!announced) {
       announced = true
-      console.error('runonmac: streaming')
+      writeSync(2, 'runonmac: streaming\n')
     }
     // Synchronous from here to the response: a signal handler can't run in
     // between, so stdout and DIR/offset always agree.

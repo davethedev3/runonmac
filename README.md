@@ -32,8 +32,10 @@ the web UI, because the workflow accepts only encrypted input.
 
 The CLI starts `listen.ts` (with bun), which serves localhost through a
 cloudflared [quick tunnel](https://try.cloudflare.com)
-and makes up a random token. The tunnel URL and token travel to the runner
-encrypted, like the command. While the command runs, a sender in the Run step
+and makes up a random token. The CLI dispatches only once the tunnel answers,
+which takes a few seconds, because a runner that looks up a quick-tunnel name
+before it exists caches the miss for 60 seconds. The tunnel URL and token
+travel to the runner encrypted, like the command. While the command runs, a sender in the Run step
 reads new log bytes about once a second and encrypts them to your identity. It
 then POSTs them to the tunnel, and the listener decrypts and prints them. Each
 reply carries the number of bytes printed so far, so a lost or repeated POST

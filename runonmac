@@ -147,6 +147,14 @@ if [[ $stream ]]; then
     done
     if [[ -s $tmp/live/url ]]; then
       url=$(<"$tmp/live/url")
+      # Dispatch only once the name resolves and the tunnel answers. A runner
+      # that looks the name up before it exists caches NXDOMAIN for 60s. The
+      # probe asks 1.1.1.1 directly, so this host's resolver can't cache a miss.
+      ready=$((SECONDS + 20))
+      until curl -fsS -m 5 --doh-url https://1.1.1.1/dns-query -o /dev/null "$url/ready" 2>/dev/null ||
+          ((SECONDS >= ready)); do
+        sleep 0.5
+      done
     else
       stop_listener
       say "no tunnel came up; output will print when the run ends"
@@ -174,7 +182,12 @@ if [[ ! $id ]]; then
     commit=$(git commit-tree "$tree" -m runonmac)
     unset GIT_DIR
     branch="run/$(date +%s)-$RANDOM"
-    git --git-dir="$gitdir" push -q origin "$commit:refs/heads/$branch"
+    # Quiet unless it fails: GitHub's "create a pull request" lines are noise.
+    if ! git --git-dir="$gitdir" push -q origin "$commit:refs/heads/$branch" 2>"$tmp/push.err"; then
+      branch=''
+      cat "$tmp/push.err" >&2
+      die "couldn't push the -d snapshot"
+    fi
     ref=$branch
   fi
 
@@ -209,7 +222,8 @@ while :; do
   sleep 5
 done
 
-if ! gh run download "$id" -R "$repo" -n output -D "$tmp/output" 2>/dev/null; then
+# stdout to /dev/null too: on a TTY, gh sends terminal queries (OSC 11, DSR).
+if ! gh run download "$id" -R "$repo" -n output -D "$tmp/output" >/dev/null 2>&1; then
   # No sealed output means the run failed before the command; its log holds only ciphertext.
   stop_listener
   gh run view "$id" -R "$repo" --log-failed >&2
