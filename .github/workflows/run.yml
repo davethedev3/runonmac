@@ -40,6 +40,10 @@ on:
         description: Command timeout in minutes (max 350)
         type: number
         default: 60
+      stream:
+        description: Live-log URL, age-encrypted (armored) to runner.pub; empty for none
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -75,12 +79,16 @@ jobs:
         env:
           COMMAND: ${{ inputs.command }}
           ARTIFACTS: ${{ inputs.artifacts }}
+          STREAM: ${{ inputs.stream }}
           RUNONMAC_KEY: ${{ secrets.RUNONMAC_KEY }}
         run: |
           key=$RUNNER_TEMP/key
           (umask 077; printf '%s\n' "$RUNONMAC_KEY" > "$key")
           age -d -i "$key" -o "$RUNNER_TEMP/command.sh" <<<"$COMMAND"
           age -d -i "$key" -o "$RUNNER_TEMP/artifacts" <<<"$ARTIFACTS"
+          if [[ $STREAM ]]; then
+            age -d -i "$key" -o "$RUNNER_TEMP/stream" <<<"$STREAM"
+          fi
           if [[ -f .runonmac-payload.age ]]; then
             age -d -i "$key" .runonmac-payload.age | tar -x
             rm .runonmac-payload.age
@@ -88,10 +96,64 @@ jobs:
           rm "$key"
 
       # Output goes only to a file, so the public log shows nothing but the exit code.
+      # With a stream URL, a background sender also POSTs the file's new bytes,
+      # age-encrypted to the recipient, to the CLI's tunnel; it is silenced too.
       - name: Run
         id: run
         timeout-minutes: ${{ fromJSON(inputs.timeout) }}
-        run: bash -eo pipefail "$RUNNER_TEMP/command.sh" > "$RUNNER_TEMP/log" 2>&1
+        env:
+          RECIPIENT: ${{ inputs.recipient }}
+        run: |
+          # The reply to each POST is the CLI's printed byte count, which becomes
+          # the next offset. Stops once $3 exists and everything is sent, 15s
+          # after $3, or at $3 if no send ever succeeded. Failures only delay it.
+          stream() {
+            set +e
+            local url=$1 log=$2 done=$3 recipient=$4
+            local off=0 size resp deadline='' ok='' max chunk=$RUNNER_TEMP/stream-chunk
+            while :; do
+              if [[ -e $done && ! $deadline ]]; then
+                [[ $ok ]] || return 0
+                deadline=$((SECONDS + 15))
+              fi
+              if [[ $deadline ]] && ((SECONDS >= deadline)); then return 0; fi
+              size=$(wc -c < "$log")
+              if ((size > off)); then
+                tail -c +$((off + 1)) "$log" | head -c 1048576 | age -r "$recipient" > "$chunk"
+                max=30
+                [[ $deadline ]] && max=5
+                if resp=$(curl -fsS -m "$max" -H 'Content-Type: application/octet-stream' \
+                    --data-binary @"$chunk" "$url/$off") && [[ $resp =~ ^[0-9]+$ ]]; then
+                  ok=1
+                  if ((resp > off)); then off=$resp; continue; fi
+                  off=$resp
+                fi
+                sleep 2
+              elif [[ $deadline ]]; then
+                return 0
+              else
+                sleep 1
+              fi
+            done
+          }
+
+          log=$RUNNER_TEMP/log
+          : > "$log"
+          recipient=$RECIPIENT
+          unset RECIPIENT
+          sender=''
+          if [[ -s $RUNNER_TEMP/stream ]]; then
+            stream "$(<"$RUNNER_TEMP/stream")" "$log" "$RUNNER_TEMP/done" "$recipient" \
+              </dev/null >/dev/null 2>&1 &
+            sender=$!
+          fi
+          status=0
+          bash -eo pipefail "$RUNNER_TEMP/command.sh" >> "$log" 2>&1 || status=$?
+          if [[ $sender ]]; then
+            touch "$RUNNER_TEMP/done"
+            wait "$sender" || true
+          fi
+          exit "$status"
 
       - name: Seal
         id: seal

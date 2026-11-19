@@ -10,7 +10,7 @@ usage: runonmac [options] [--] COMMAND...
        runonmac --fetch RUN_ID [-o DIR]
 
 Runs COMMAND (or the contents of SCRIPT) with bash on a GitHub-hosted macOS
-runner, waits for it, prints its output and fetches any requested files.
+runner, prints its output as it runs, and fetches any requested files.
 Exits non-zero if the run fails.
 
   -r, --runner LABEL     runner image (default macos-latest; choices in run.yml)
@@ -22,22 +22,36 @@ Exits non-zero if the run fails.
                          workspace; repeatable
   -o, --out DIR          where returned files land (default ./runonmac-out/RUN_ID)
   -t, --timeout MIN      command timeout in minutes (default 60, max 350)
+      --no-stream        print the output when the run ends, not as it runs
       --fetch RUN_ID     wait for an earlier run and collect its output
   -h, --help
 
-The command, artifact list, shipped DIR, log and returned files are encrypted.
-Run timing, runner image, exit status, --repo/--ref and ciphertext sizes are public.
+stdout carries the command's output (its stdout and stderr merged). stderr
+carries this CLI's lines, each starting "runonmac: ": the run URL, state
+changes (queued, in_progress, streaming), and a final
+"runonmac: done: CONCLUSION, exit N, run ID" on every exit once a run exists.
+
+Live output needs bun and cloudflared: the runner POSTs the log, encrypted,
+through a cloudflared quick tunnel to a listener here (listen.ts). Without
+them, or if the tunnel fails, the output is printed when the run ends.
+
+The command, artifact list, shipped DIR, tunnel URL, log and returned files
+are encrypted. Run timing, runner image, exit status, --repo/--ref and
+ciphertext sizes are public; Cloudflare also sees live ciphertext and its timing.
 Output is encrypted to the age identity at $RUNONMAC_IDENTITY
 (default ~/.config/runonmac/identity, created on first use).
 RUNONMAC_REPO=owner/name targets a repo other than the one holding this script.
+RUNONMAC_WORKFLOW_REF=BRANCH dispatches that branch's run.yml instead of the
+default branch's, to test workflow changes before merging them.
 EOF
 }
 
-die() { echo "runonmac: $*" >&2; exit 2; }
+say() { echo "runonmac: $*" >&2; }
+die() { say "$*"; exit 2; }
 
 here=$(dirname "$(readlink -f "$0")")
 identity=${RUNONMAC_IDENTITY:-${XDG_CONFIG_HOME:-$HOME/.config}/runonmac/identity}
-runner=macos-latest file='' dir='' repository='' ref='' out='' timeout=60 id=''
+runner=macos-latest file='' dir='' repository='' ref='' out='' timeout=60 id='' stream=1
 artifacts=()
 
 while (($#)); do
@@ -50,6 +64,7 @@ while (($#)); do
     -a|--artifact) artifacts+=("$2"); shift 2 ;;
     -o|--out)      out=$2; shift 2 ;;
     -t|--timeout)  timeout=$2; shift 2 ;;
+    --no-stream)   stream=''; shift ;;
     --fetch)       id=$2; shift 2 ;;
     -h|--help)     usage; exit 0 ;;
     --)            shift; break ;;
@@ -60,6 +75,7 @@ done
 
 if [[ $id ]]; then
   if (($#)) || [[ $file ]]; then die "--fetch takes no command"; fi
+  stream=''
 elif [[ $file ]]; then
   (($# == 0)) || die "give either -f SCRIPT or COMMAND, not both"
   command=$(<"$file")
@@ -79,18 +95,66 @@ if [[ ! -f $identity ]]; then
   mkdir -p "$(dirname "$identity")"
   (umask 077; age-keygen -o "$identity.$$" 2>/dev/null)
   if ln "$identity.$$" "$identity" 2>/dev/null; then
-    echo "runonmac: created output identity $identity" >&2
+    say "created output identity $identity"
   fi
   rm "$identity.$$"
 fi
 
 read -r repo main < <(cd "$here" && gh repo view ${RUNONMAC_REPO:+"$RUNONMAC_REPO"} \
   --json nameWithOwner,defaultBranchRef -q '"\(.nameWithOwner) \(.defaultBranchRef.name)"')
+main=${RUNONMAC_WORKFLOW_REF:-$main}
 
 tmp=$(mktemp -d)
-gitdir='' branch=''
-trap 'rm -rf "$tmp"
-  if [[ $branch ]]; then git --git-dir="$gitdir" push -q origin --delete "$branch" 2>/dev/null || true; fi' EXIT
+gitdir='' branch='' listener='' conclusion=''
+
+stop_listener() {
+  if [[ $listener ]]; then
+    kill "$listener" 2>/dev/null || true
+    wait "$listener" 2>/dev/null || true
+    listener=''
+  fi
+}
+
+# Every exit once a run exists ends with one "done" line, so a watcher that
+# filters on "^runonmac: " always sees how it ended.
+finish() {
+  local rc=$?
+  stop_listener
+  rm -rf "$tmp"
+  if [[ $branch ]]; then git --git-dir="$gitdir" push -q origin --delete "$branch" 2>/dev/null || true; fi
+  if [[ $id ]]; then
+    if [[ ! $conclusion ]]; then
+      conclusion=interrupted
+      say "the run continues on GitHub; collect it with: runonmac --fetch $id"
+    fi
+    say "done: $conclusion, exit $rc, run $id"
+  fi
+}
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+url=''
+if [[ $stream ]]; then
+  if command -v bun >/dev/null && command -v cloudflared >/dev/null; then
+    mkdir "$tmp/live"
+    bun "$here/listen.ts" "$identity" "$tmp/live" $$ &
+    listener=$!
+    for _ in {1..60}; do
+      [[ -s $tmp/live/url ]] && break
+      kill -0 "$listener" 2>/dev/null || break
+      sleep 0.5
+    done
+    if [[ -s $tmp/live/url ]]; then
+      url=$(<"$tmp/live/url")
+    else
+      stop_listener
+      say "no tunnel came up; output will print when the run ends"
+    fi
+  else
+    say "bun or cloudflared not found; output will print when the run ends"
+  fi
+fi
 
 if [[ ! $id ]]; then
   runner_pub=$(gh api -H 'Accept: application/vnd.github.raw' "repos/$repo/contents/runner.pub")
@@ -114,41 +178,59 @@ if [[ ! $id ]]; then
     ref=$branch
   fi
 
+  # The stream input is left out when there is no tunnel.
   resp=$(jq -n \
     --arg main "$main" --arg runner "$runner" --arg repository "$repository" \
     --arg ref "$ref" --arg recipient "$(age-keygen -y "$identity")" --arg timeout "$timeout" \
     --arg command "$(printf '%s\n' "$command" | seal)" \
     --arg artifacts "$(printf '%s\n' "${artifacts[@]}" | seal)" \
-    '{ref: $main, return_run_details: true, inputs: {command: $command, runner: $runner,
+    --arg stream "$(if [[ $url ]]; then printf '%s\n' "$url" | seal; fi)" \
+    '{ref: $main, return_run_details: true, inputs: ({command: $command, runner: $runner,
       repository: $repository, ref: $ref, artifacts: $artifacts, recipient: $recipient,
-      timeout: $timeout}}' |
+      timeout: $timeout} + if $stream == "" then {} else {stream: $stream} end)}' |
     gh api -X POST "repos/$repo/actions/workflows/run.yml/dispatches" --input -)
   id=$(jq -r .workflow_run_id <<<"$resp")
-  echo "runonmac: $(jq -r .html_url <<<"$resp")" >&2
-  echo "runonmac: if interrupted, collect it later with: runonmac --fetch $id" >&2
-
-  # A fresh run's jobs endpoint can 404 briefly, which makes `gh run watch` give up.
-  for _ in {1..30}; do
-    gh api "repos/$repo/actions/runs/$id/jobs" >/dev/null 2>&1 && break
-    sleep 2
-  done
+  say "dispatched run $id: $(jq -r .html_url <<<"$resp")"
 fi
 
-status=0
-gh run watch "$id" -R "$repo" --compact --exit-status >&2 || status=$?
+# Poll the run, printing each state change once. A fresh run can 404 briefly,
+# so errors are retried, up to about five minutes in a row.
+state='' failures=0
+while :; do
+  if now=$(gh run view "$id" -R "$repo" --json status,conclusion -q '"\(.status) \(.conclusion)"' 2>"$tmp/view.err"); then
+    failures=0
+    read -r status result <<<"$now"
+    [[ $status == "$state" ]] || { state=$status; [[ $status == completed ]] || say "$status"; }
+    [[ $status == completed ]] && break
+  elif ((++failures >= 60)); then
+    cat "$tmp/view.err" >&2
+    die "can't read run $id"
+  fi
+  sleep 5
+done
 
 if ! gh run download "$id" -R "$repo" -n output -D "$tmp/output" 2>/dev/null; then
   # No sealed output means the run failed before the command; its log holds only ciphertext.
+  stop_listener
   gh run view "$id" -R "$repo" --log-failed >&2
-  exit $((status ? status : 1))
+  conclusion=$result
+  exit 1
 fi
-age -d -i "$identity" "$tmp/output/log.age"
+
+# Print what the live stream didn't: the sealed log from the listener's offset on.
+printed=0
+if [[ $listener ]]; then
+  stop_listener
+  [[ -s $tmp/live/offset ]] && printed=$(<"$tmp/live/offset")
+fi
+age -d -i "$identity" "$tmp/output/log.age" | tail -c +$((printed + 1))
 if [[ -f $tmp/output/files.age ]]; then
   out=${out:-runonmac-out/$id}
   mkdir -p "$out"
   age -d -i "$identity" "$tmp/output/files.age" | tar -x -C "$out"
-  echo "runonmac: files in $out" >&2
+  say "files in $out"
 elif ((${#artifacts[@]})); then
-  echo "runonmac: no files matched the -a patterns" >&2
+  say "no files matched the -a patterns"
 fi
-exit "$status"
+conclusion=$result
+[[ $result == success ]]

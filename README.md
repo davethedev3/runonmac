@@ -8,7 +8,8 @@ readable is encrypted with [age](https://github.com/FiloSottile/age).
 ## Use
 
 Requires `gh` (logged in, with write access to this repo), `git`, `jq`, `age`
-and `age-keygen`.
+and `age-keygen`. Live output also needs `bun` and `cloudflared`; without
+them the output prints when the run ends.
 
 ```sh
 ./runonmac sw_vers                                   # one command
@@ -18,7 +19,7 @@ and `age-keygen`.
 ./runonmac -R owner/project --ref v2 -- make check   # check out another public repo
 ```
 
-The CLI dispatches the workflow, follows the run, prints the command's output,
+The CLI dispatches the workflow, prints the command's output as it runs,
 extracts any `-a` files into `runonmac-out/<run id>/`, and exits non-zero if
 the run failed. If the CLI is interrupted, the run continues on GitHub, and
 `./runonmac --fetch RUN_ID` (the ID is printed at dispatch) waits for it and
@@ -27,12 +28,36 @@ globs like `build/*.ipa`; the runners' bash 3.2 has no recursive `**`.
 `./runonmac -h` lists every option. Runs can't be started from
 the web UI, because the workflow accepts only encrypted input.
 
+## Live output
+
+The CLI starts `listen.ts` (with bun), which serves localhost through a
+cloudflared [quick tunnel](https://try.cloudflare.com)
+and makes up a random token. The tunnel URL and token travel to the runner
+encrypted, like the command. While the command runs, a sender in the Run step
+reads new log bytes about once a second and encrypts them to your identity. It
+then POSTs them to the tunnel, and the listener decrypts and prints them. Each
+reply carries the number of bytes printed so far, so a lost or repeated POST
+is resent or skipped rather than printed twice. When the run ends, the CLI
+prints whatever the stream missed from the sealed log, so the output is always
+complete and the same as `--fetch` would give.
+
+The stream is best-effort. A tunnel that doesn't come up, a dead tunnel or a
+killed CLI never fails or holds up the run; at most it adds 15 seconds at the
+end. GitHub's own job log can't be read until the job ends, so there is no
+channel for live output inside GitHub. `--no-stream` turns it off.
+
+stdout carries only the command's output. Every CLI line goes to stderr and
+starts with `runonmac: `: the dispatched run's ID and URL, each state change
+(`queued`, `in_progress`, `streaming`), and on every exit once a run exists, a
+final `runonmac: done: CONCLUSION, exit N, run ID`. A watcher can merge the two
+streams and filter on that prefix.
+
 ## Encryption
 
 | Data | Encrypted to | Decrypted by |
 |---|---|---|
-| Command, `-a` patterns, `-d` directory | `runner.pub` | the runner, using the `RUNONMAC_KEY` repo secret |
-| Command output (stdout and stderr) and `-a` files | your identity, `~/.config/runonmac/identity` (created on first use; `RUNONMAC_IDENTITY` overrides) | the CLI |
+| Command, `-a` patterns, `-d` directory, live-output URL | `runner.pub` | the runner, using the `RUNONMAC_KEY` repo secret |
+| Command output (stdout and stderr), live or sealed, and `-a` files | your identity, `~/.config/runonmac/identity` (created on first use; `RUNONMAC_IDENTITY` overrides) | the CLI |
 
 The runner deletes its key file before running the command, and the command's
 output goes only to the encrypted log, so the public step log shows just the
@@ -40,7 +65,9 @@ exit code.
 
 **Still public:** that a run happened and when, its duration, the runner
 image, the exit status, the `--repo`/`--ref` values, ciphertext sizes, and
-whether `-a` was used.
+whether `-a` was used. Whether live output was used is public too (the
+`stream` input is empty or not). Cloudflare, though not the public, also sees
+the live ciphertext, its timing and its chunk sizes.
 
 **Rotating the runner key** (for example, if the secret may have leaked):
 
