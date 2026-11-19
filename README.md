@@ -44,8 +44,8 @@ prints whatever the stream missed from the sealed log, so the output is always
 complete and the same as `--fetch` would give.
 
 The stream is best-effort. A tunnel that doesn't come up, a dead tunnel or a
-killed CLI never fails or holds up the run; at most it adds 15 seconds at the
-end. GitHub's own job log can't be read until the job ends, so there is no
+killed CLI never fails or holds up the run; at most it adds about 20 seconds
+at the end. GitHub's own job log can't be read until the job ends, so there is no
 channel for live output inside GitHub. `--no-stream` turns it off.
 
 stdout carries only the command's output. Every CLI line goes to stderr and

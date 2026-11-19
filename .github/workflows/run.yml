@@ -105,8 +105,10 @@ jobs:
           RECIPIENT: ${{ inputs.recipient }}
         run: |
           # The reply to each POST is the CLI's printed byte count, which becomes
-          # the next offset. Stops once $3 exists and everything is sent, 15s
-          # after $3, or at $3 if no send ever succeeded. Failures only delay it.
+          # the next offset. Stops once $3 exists and everything is sent, 10s
+          # after it first sees $3, or at $3 if no send ever succeeded. A POST
+          # gets at most 10s (chunks are 256 KiB), so a dead tunnel adds about
+          # 20s at most after the command.
           stream() {
             set +e
             local url=$1 log=$2 done=$3 recipient=$4
@@ -114,14 +116,17 @@ jobs:
             while :; do
               if [[ -e $done && ! $deadline ]]; then
                 [[ $ok ]] || return 0
-                deadline=$((SECONDS + 15))
+                deadline=$((SECONDS + 10))
               fi
               if [[ $deadline ]] && ((SECONDS >= deadline)); then return 0; fi
               size=$(wc -c < "$log")
               if ((size > off)); then
-                tail -c +$((off + 1)) "$log" | head -c 1048576 | age -r "$recipient" > "$chunk"
-                max=30
-                [[ $deadline ]] && max=5
+                tail -c +$((off + 1)) "$log" | head -c 262144 | age -r "$recipient" > "$chunk"
+                max=10
+                if [[ $deadline ]]; then
+                  max=$((deadline - SECONDS))
+                  ((max > 0)) || return 0
+                fi
                 if resp=$(curl -fsS -m "$max" -H 'Content-Type: application/octet-stream' \
                     --data-binary @"$chunk" "$url/$off") && [[ $resp =~ ^[0-9]+$ ]]; then
                   ok=1
