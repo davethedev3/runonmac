@@ -107,6 +107,13 @@ main=${RUNONMAC_WORKFLOW_REF:-$main}
 tmp=$(mktemp -d)
 gitdir='' branch='' listener='' conclusion=''
 
+drop_branch() {
+  if [[ $branch ]]; then
+    git --git-dir="$gitdir" push -q origin --delete "$branch" 2>/dev/null || true
+    branch=''
+  fi
+}
+
 stop_listener() {
   if [[ $listener ]]; then
     kill "$listener" 2>/dev/null || true
@@ -119,16 +126,16 @@ stop_listener() {
 # filters on "^runonmac: " always sees how it ended.
 finish() {
   local rc=$?
+  # Interrupted: report first, because a Monitor that expires sends SIGKILL
+  # under 2s after SIGTERM, before the cleanup below can finish.
+  if [[ $id && ! $conclusion ]]; then
+    say "the run continues on GitHub; collect it with: runonmac --fetch $id"
+    say "done: interrupted, exit $rc, run $id"
+  fi
+  drop_branch
   stop_listener
   rm -rf "$tmp"
-  if [[ $branch ]]; then git --git-dir="$gitdir" push -q origin --delete "$branch" 2>/dev/null || true; fi
-  if [[ $id ]]; then
-    if [[ ! $conclusion ]]; then
-      conclusion=interrupted
-      say "the run continues on GitHub; collect it with: runonmac --fetch $id"
-    fi
-    say "done: $conclusion, exit $rc, run $id"
-  fi
+  if [[ $id && $conclusion ]]; then say "done: $conclusion, exit $rc, run $id"; fi
 }
 trap finish EXIT
 trap 'exit 130' INT
@@ -182,6 +189,17 @@ if [[ ! $id ]]; then
     tree=$(printf '100644 blob %s\t.runonmac-payload.age\n' "$blob" | git mktree)
     commit=$(git commit-tree "$tree" -m runonmac)
     unset GIT_DIR
+    # Sweep snapshot branches older than any job can run (6h), left by a CLI
+    # killed before it could delete its own.
+    git --git-dir="$gitdir" ls-remote --heads origin 'run/*' 2>/dev/null |
+      while read -r _ old; do
+        old=${old#refs/heads/}
+        made=${old#run/}
+        made=${made%%-*}
+        if [[ $made =~ ^[0-9]+$ ]] && (($(date +%s) - made > 7 * 3600)); then
+          git --git-dir="$gitdir" push -q origin --delete "$old" 2>/dev/null || true
+        fi
+      done
     branch="run/$(date +%s)-$RANDOM"
     # Quiet unless it fails: GitHub's "create a pull request" lines are noise.
     if ! git --git-dir="$gitdir" push -q origin "$commit:refs/heads/$branch" 2>"$tmp/push.err"; then
@@ -215,6 +233,15 @@ while :; do
     failures=0
     read -r status result <<<"$now"
     [[ $status == "$state" ]] || { state=$status; [[ $status == completed ]] || say "$status"; }
+    # Drop the -d snapshot branch as soon as the runner has checked it out. A
+    # CLI killed outright can't leave it behind: an expiring Monitor sends
+    # SIGKILL under 2s after SIGTERM, too soon for the EXIT trap's push.
+    if [[ $branch && $status != queued ]] && { [[ $status == completed ]] ||
+        [[ $(gh run view "$id" -R "$repo" --json jobs -q \
+          '[.jobs[].steps[]? | select(.name | test("checkout")) | .status] | any(. == "completed")' \
+          2>/dev/null) == true ]]; }; then
+      drop_branch
+    fi
     [[ $status == completed ]] && break
   elif ((++failures >= 60)); then
     cat "$tmp/view.err" >&2
